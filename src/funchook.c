@@ -56,7 +56,6 @@
 
 struct funchook {
     int installed;
-    funchook_page_t *page_list;
     char error_message[FUNCHOOK_MAX_ERROR_MESSAGE_LEN];
     FILE *fp;
 };
@@ -65,6 +64,7 @@ char funchook_debug_file[PATH_MAX];
 
 const size_t funchook_size = sizeof(funchook_t);
 
+funchook_page_t* funchook_page_list;
 static size_t num_entries_in_page;
 
 static void funchook_logv(funchook_t *funchook, int set_error, const char *fmt, va_list ap);
@@ -307,6 +307,8 @@ static int funchook_prepare_internal(funchook_t *funchook, void **target_func,
         funchook_log(funchook, "  failed to get page\n");
         return rv;
     }
+    // The page might have been protected from previous funchook installs
+    funchook_page_unprotect(funchook, page);
     entry = &page->entries[page->used];
     /* fill members */
     entry->original_target_func = *target_func;
@@ -375,7 +377,7 @@ static int funchook_install_internal(funchook_t *funchook, int flags)
         return FUNCHOOK_ERROR_ALREADY_INSTALLED;
     }
 
-    for (page = funchook->page_list; page != NULL; page = page->next) {
+    for (page = funchook_page_list; page != NULL; page = page->next) {
         int rv = funchook_page_protect(funchook, page);
         int i;
 
@@ -423,7 +425,7 @@ static int funchook_uninstall_internal(funchook_t *funchook, int flags)
         return FUNCHOOK_ERROR_NOT_INSTALLED;
     }
 
-    for (page = funchook->page_list; page != NULL; page = page->next) {
+    for (page = funchook_page_list; page != NULL; page = page->next) {
         int i;
 
         for (i = 0; i < page->used; i++) {
@@ -458,7 +460,7 @@ static int funchook_destroy_internal(funchook_t *funchook)
     if (funchook->installed) {
         return FUNCHOOK_ERROR_ALREADY_INSTALLED;
     }
-    for (page = funchook->page_list; page != NULL; page = page_next) {
+    for (page = funchook_page_list; page != NULL; page = page_next) {
         page_next = page->next;
         funchook_page_free(funchook, page);
     }
@@ -474,7 +476,7 @@ static int get_page(funchook_t *funchook, funchook_page_t **page_out, uint8_t *a
     funchook_page_t *page;
     int rv;
 
-    for (page = funchook->page_list; page != NULL; page = page->next) {
+    for (page = funchook_page_list; page != NULL; page = page->next) {
         if (page->used < num_entries_in_page && funchook_page_avail(funchook, page, page->used, addr, disp)) {
             /* Reuse allocated page. */
             *page_out = page;
@@ -491,8 +493,8 @@ static int get_page(funchook_t *funchook, funchook_page_t **page_out, uint8_t *a
         return FUNCHOOK_ERROR_NO_SPACE_NEAR_TARGET_ADDR;
     }
     page->used = 0;
-    page->next = funchook->page_list;
-    funchook->page_list = page;
+    page->next = funchook_page_list;
+    funchook_page_list = page;
     *page_out = page;
     return 0;
 }

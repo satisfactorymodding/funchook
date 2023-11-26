@@ -151,6 +151,7 @@ typedef struct funchook_page {
 } funchook_page_t;
 
 /* Functions in funchook.c */
+extern funchook_page_t* funchook_page_list;
 extern const size_t funchook_size;
 extern char funchook_debug_file[];
 void funchook_log(funchook_t *funchook, const char *fmt, ...) ATTR_FORMAT_PRINTF(2, 3);
