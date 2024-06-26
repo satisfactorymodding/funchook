@@ -54,8 +54,15 @@
 
 #define FUNCHOOK_MAX_ERROR_MESSAGE_LEN 200
 
+typedef struct funchook_instance_entry {
+    funchook_page_t *page;
+    size_t index;
+    struct funchook_instance_entry *next;
+} funchook_instance_entry_t;
+
 struct funchook {
     int installed;
+    funchook_instance_entry_t *instance_entries;
     char error_message[FUNCHOOK_MAX_ERROR_MESSAGE_LEN];
     FILE *fp;
 };
@@ -77,6 +84,7 @@ static int funchook_install_internal(funchook_t *funchook, int flags);
 static int funchook_uninstall_internal(funchook_t *funchook, int flags);
 static int funchook_destroy_internal(funchook_t *funchook);
 static int get_page(funchook_t *funchook, funchook_page_t **page_out, uint8_t *addr, ip_displacement_t *disp);
+static int find_free_entry(funchook_t *funchook, funchook_page_t * page, funchook_entry_t ** entry);
 
 static void flush_instruction_cache(void *addr, size_t size)
 {
@@ -307,9 +315,16 @@ static int funchook_prepare_internal(funchook_t *funchook, void **target_func,
         funchook_log(funchook, "  failed to get page\n");
         return rv;
     }
-    // The page might have been protected from previous funchook installs
+
+    // Unprotect the page to write the hook code
     funchook_page_unprotect(funchook, page);
-    entry = &page->entries[page->used];
+
+    rv = find_free_entry(funchook, page, &entry);
+    if (rv != 0) {
+        funchook_log(funchook, "  failed to find free entry\n");
+        return rv;
+    }
+
     /* fill members */
     entry->original_target_func = *target_func;
     entry->target_func = func;
@@ -341,6 +356,16 @@ static int funchook_prepare_internal(funchook_t *funchook, void **target_func,
 
     page->used++;
     *target_func = (void*)entry->trampoline;
+
+    funchook_instance_entry_t *instance_entry = calloc(1, sizeof(*instance_entry));
+    instance_entry->page = page;
+    instance_entry->index = entry - page->entries;
+    instance_entry->next = funchook->instance_entries;
+    funchook->instance_entries = instance_entry;
+
+    // Protect the page as there might be other hooks written to it that want to execute
+    funchook_page_protect(funchook, page);
+
     return 0;
 }
 
@@ -371,46 +396,45 @@ static void funchook_log_trampoline(funchook_t *funchook, const insn_t *trampoli
 
 static int funchook_install_internal(funchook_t *funchook, int flags)
 {
-    funchook_page_t *page;
+    funchook_instance_entry_t *instance_entry;
 
     if (funchook->installed) {
         return FUNCHOOK_ERROR_ALREADY_INSTALLED;
     }
 
-    for (page = funchook_page_list; page != NULL; page = page->next) {
+    for (instance_entry = funchook->instance_entries; instance_entry != NULL; instance_entry = instance_entry->next) {
+        funchook_page_t *page = instance_entry->page;
+
         int rv = funchook_page_protect(funchook, page);
-        int i;
 
         if (rv != 0) {
             return rv;
         }
 
-        for (i = 0; i < page->used; i++) {
-            funchook_entry_t *entry = &page->entries[i];
-            size_t patch_code_byte_size = entry->patch_code_size * sizeof(insn_t);
-            mem_state_t mstate;
-            int rv = funchook_unprotect_begin(funchook, &mstate, entry->target_func, patch_code_byte_size);
+        funchook_entry_t *entry = &page->entries[instance_entry->index];
+        size_t patch_code_byte_size = entry->patch_code_size * sizeof(insn_t);
+        mem_state_t mstate;
+        rv = funchook_unprotect_begin(funchook, &mstate, entry->target_func, patch_code_byte_size);
 
-            if (rv != 0) {
-                return rv;
-            }
-            memcpy(entry->target_func, entry->new_code, patch_code_byte_size);
-            rv = funchook_unprotect_end(funchook, &mstate);
-            if (rv != 0) {
-                return rv;
-            }
-            flush_instruction_cache(entry->target_func, patch_code_byte_size);
+        if (rv != 0) {
+            return rv;
+        }
+        memcpy(entry->target_func, entry->new_code, patch_code_byte_size);
+        rv = funchook_unprotect_end(funchook, &mstate);
+        if (rv != 0) {
+            return rv;
+        }
+        flush_instruction_cache(entry->target_func, patch_code_byte_size);
 
-            if (funchook_debug_file[0]) {
-                funchook_disasm_t disasm;
-                const funchook_insn_t *insn;
-                funchook_log(funchook, "  Patched Instructions:\n");
-                funchook_disasm_init(&disasm, funchook, entry->target_func, entry->patch_code_size + 5, (size_t)entry->target_func);
-                while ((rv = funchook_disasm_next(&disasm, &insn)) == 0) {
-                    funchook_disasm_log_instruction(&disasm, insn);
-                }
-                funchook_disasm_cleanup(&disasm);
+        if (funchook_debug_file[0]) {
+            funchook_disasm_t disasm;
+            const funchook_insn_t *insn;
+            funchook_log(funchook, "  Patched Instructions:\n");
+            funchook_disasm_init(&disasm, funchook, entry->target_func, entry->patch_code_size + 5, (size_t)entry->target_func);
+            while ((rv = funchook_disasm_next(&disasm, &insn)) == 0) {
+                funchook_disasm_log_instruction(&disasm, insn);
             }
+            funchook_disasm_cleanup(&disasm);
         }
     }
     funchook->installed = 1;
@@ -419,32 +443,29 @@ static int funchook_install_internal(funchook_t *funchook, int flags)
 
 static int funchook_uninstall_internal(funchook_t *funchook, int flags)
 {
-    funchook_page_t *page;
+    funchook_instance_entry_t *instance_entry;
 
     if (!funchook->installed) {
         return FUNCHOOK_ERROR_NOT_INSTALLED;
     }
 
-    for (page = funchook_page_list; page != NULL; page = page->next) {
-        int i;
 
-        for (i = 0; i < page->used; i++) {
-            funchook_entry_t *entry = &page->entries[i];
-            size_t patch_code_byte_size = entry->patch_code_size * sizeof(insn_t);
-            mem_state_t mstate;
-            int rv = funchook_unprotect_begin(funchook, &mstate, entry->target_func, patch_code_byte_size);
+    for (instance_entry = funchook->instance_entries; instance_entry != NULL; instance_entry = instance_entry->next) {
+        funchook_page_t *page = instance_entry->page;
+        funchook_entry_t *entry = &page->entries[instance_entry->index];
+        size_t patch_code_byte_size = entry->patch_code_size * sizeof(insn_t);
+        mem_state_t mstate;
+        int rv = funchook_unprotect_begin(funchook, &mstate, entry->target_func, patch_code_byte_size);
 
-            if (rv != 0) {
-                return rv;
-            }
-            memcpy(entry->target_func, entry->old_code, patch_code_byte_size);
-            rv = funchook_unprotect_end(funchook, &mstate);
-            if (rv != 0) {
-                return rv;
-            }
-            flush_instruction_cache(entry->target_func, patch_code_byte_size);
+        if (rv != 0) {
+            return rv;
         }
-        funchook_page_unprotect(funchook, page);
+        memcpy(entry->target_func, entry->old_code, patch_code_byte_size);
+        rv = funchook_unprotect_end(funchook, &mstate);
+        if (rv != 0) {
+            return rv;
+        }
+        flush_instruction_cache(entry->target_func, patch_code_byte_size);
     }
     funchook->installed = 0;
     return 0;
@@ -452,7 +473,7 @@ static int funchook_uninstall_internal(funchook_t *funchook, int flags)
 
 static int funchook_destroy_internal(funchook_t *funchook)
 {
-    funchook_page_t *page, *page_next;
+    funchook_instance_entry_t *instance_entry;
 
     if (funchook == NULL) {
        return -1;
@@ -460,10 +481,55 @@ static int funchook_destroy_internal(funchook_t *funchook)
     if (funchook->installed) {
         return FUNCHOOK_ERROR_ALREADY_INSTALLED;
     }
+
+    for (instance_entry = funchook->instance_entries; instance_entry != NULL; instance_entry = instance_entry->next) {
+        funchook_page_t *page = instance_entry->page;
+        funchook_entry_t *entry = &page->entries[instance_entry->index];
+
+        int rv = funchook_page_unprotect(funchook, page);
+        if (rv != 0) {
+            return rv;
+        }
+
+        memset(entry, 0, sizeof(*entry));
+        page->used--;
+
+        rv = funchook_page_protect(funchook, page);
+        if (rv != 0) {
+            return rv;
+        }
+    }
+
+    funchook_page_t *page, *page_next, *page_prev = NULL;
     for (page = funchook_page_list; page != NULL; page = page_next) {
         page_next = page->next;
-        funchook_page_free(funchook, page);
+        if (page->used == 0) {
+            funchook_page_unprotect(funchook, page);
+
+            // Remove the current page from the chain
+            if (page_prev == NULL) {
+                funchook_page_list = page_next;
+            } else {
+                int rv = funchook_page_unprotect(funchook, page_prev);
+                if (rv != 0) {
+                    return rv;
+                }
+
+                page_prev->next = page_next;
+
+                rv = funchook_page_protect(funchook, page_prev);
+                if (rv != 0) {
+                    return rv;
+                }
+            }
+
+            funchook_page_free(funchook, page);
+        } else {
+            // Current page chain endpoint
+            page_prev = page;
+        }
     }
+
     if (funchook->fp != NULL) {
         fclose(funchook->fp);
     }
@@ -497,4 +563,16 @@ static int get_page(funchook_t *funchook, funchook_page_t **page_out, uint8_t *a
     funchook_page_list = page;
     *page_out = page;
     return 0;
+}
+
+static int find_free_entry(funchook_t *funchook, funchook_page_t *page, funchook_entry_t **entry) {
+    for (int i = 0; i < num_entries_in_page; i++) {
+        funchook_entry_t *e = &page->entries[i];
+        if (e->patch_code_size == 0) {
+            *entry = e;
+            return 0;
+        }
+    }
+    funchook_set_error_message(funchook, "Could not find an empty entry in page %p", page);
+    return FUNCHOOK_ERROR_NO_SPACE_NEAR_TARGET_ADDR;
 }
