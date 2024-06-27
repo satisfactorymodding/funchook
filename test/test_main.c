@@ -557,6 +557,84 @@ static void test_hook_many_funcs(void)
     funchook_destroy(funchook);
 }
 
+static NOINLINE int call_many_funcs_many_instances(int first_installed, int installed) {
+    int rv;
+    int expected;
+    int mul;
+    char *is_str;
+    int i = 0;
+#define S(suffix) \
+    mul = (i == 0 ? first_installed : installed) ? 2 : 1; \
+    is_str = (i == 0 ? first_installed : installed) ? "isn't" : "is"; \
+    rv = dllfunc_##suffix(2, 3); \
+    expected = (2 * 3 + suffix) * mul; \
+    if (rv != expected) { \
+        printf("ERROR: dllfunc_%s %s hooked. (expect %d but %d)\n", #suffix, is_str, expected, rv); \
+        error_cnt++; \
+        return -1; \
+    } \
+    i++;
+#include "suffix.list"
+#undef S
+    return 0;
+}
+
+static void test_multiple_funchook_instances(void)
+{
+    printf("[%d] test_multiple_funchook_instances\n", ++test_cnt);
+
+    funchook_t *first_funchook = NULL;
+    int rv;
+#define S(suffix) \
+    funchook_t *funchook_##suffix## = funchook_create(); \
+    dllfunc_##suffix##_func = dllfunc_##suffix; \
+    rv = funchook_prepare(funchook_##suffix##, (void**)&dllfunc_##suffix##_func, dllfunc_##suffix##_hook); \
+    if (rv != 0) { \
+        printf("ERROR: failed to prepare hook %s. (%s)\n", #suffix, funchook_error_message(funchook_##suffix##)); \
+        error_cnt++; \
+        return; \
+    } \
+    rv = funchook_install(funchook_##suffix##, 0); \
+    if (rv != 0) { \
+        printf("ERROR: failed to install hook %s. (%s)\n", #suffix, funchook_error_message(funchook_##suffix##)); \
+        error_cnt++; \
+        return; \
+    } \
+    if (first_funchook == NULL) { \
+        first_funchook = funchook_##suffix##; \
+    } \
+    putchar('.'); fflush(stdout); \
+    funchook_set_debug_file(NULL); /* disable logging except the first to reduce log size. */
+#include "suffix.list"
+    funchook_set_debug_file("debug.log");
+#undef S
+
+    if (call_many_funcs_many_instances(1, 1) != 0) {
+        return;
+    }
+
+    funchook_uninstall(first_funchook, 0);
+    funchook_destroy(first_funchook);
+
+    if (call_many_funcs_many_instances(0, 1) != 0) {
+        return;
+    }
+
+#define S(suffix) \
+    if (funchook_##suffix## != first_funchook) { \
+        funchook_uninstall(funchook_##suffix##, 0); \
+        funchook_destroy(funchook_##suffix##); \
+        funchook_set_debug_file(NULL); /* disable logging except the first to reduce log size. */ \
+    }
+#include "suffix.list"
+    funchook_set_debug_file("debug.log");
+#undef S
+
+    if (call_many_funcs_many_instances(0, 0) != 0) {
+        return;
+    }
+}
+
 int main()
 {
     funchook_set_debug_file("debug.log");
@@ -614,6 +692,7 @@ int main()
 
     test_hook_open_and_fopen();
     test_hook_many_funcs();
+    test_multiple_funchook_instances();
     test_prehook();
     test_cpp();
 
