@@ -319,21 +319,35 @@ fixed:
  */
 static int handle_rip_relative(make_trampoline_context_t *ctx, const rip_relative_t *rel, size_t insn_size)
 {
-    if (rel->size == 32) {
-        if (*(int32_t*)(ctx->dst + rel->offset) != (uint32_t)rel->raddr) {
-            /* sanity check.
-             * reach here if opsiz and/or disp_offset are incorrectly
-             * estimated.
-             */
-            funchook_set_error_message(ctx->funchook, "Invalid ip-relative offset %d. The value at the offset should be %08x but %08x",
-                         rel->offset, (uint32_t)rel->raddr, *(int32_t*)(ctx->dst + rel->offset));
-            return FUNCHOOK_ERROR_IP_RELATIVE_OFFSET;
+    if (rel->size == 32 || rel->size == 16 || rel->size == 8) {
+        /* sanity check.
+         * reach here if opsiz and/or disp_offset are incorrectly
+         * estimated.
+         */
+        if (rel->size == 8) {
+            if (*(int8_t*)(ctx->dst + rel->offset) != (uint8_t)rel->raddr) {
+                funchook_set_error_message(ctx->funchook, "Invalid ip-relative offset %d. The value at the offset should be %02x but %02x",
+                             rel->offset, (uint8_t)rel->raddr, *(int8_t*)(ctx->dst + rel->offset));
+                return FUNCHOOK_ERROR_IP_RELATIVE_OFFSET;
+            }
+        } else if (rel->size == 16) {
+            if (*(int16_t*)(ctx->dst + rel->offset) != (uint16_t)rel->raddr) {
+                funchook_set_error_message(ctx->funchook, "Invalid ip-relative offset %d. The value at the offset should be %04x but %04x",
+                             rel->offset, (uint16_t)rel->raddr, *(int16_t*)(ctx->dst + rel->offset));
+                return FUNCHOOK_ERROR_IP_RELATIVE_OFFSET;
+            }
+        } else {
+            if (*(int32_t*)(ctx->dst + rel->offset) != (uint32_t)rel->raddr) {
+                funchook_set_error_message(ctx->funchook, "Invalid ip-relative offset %d. The value at the offset should be %08x but %08x",
+                             rel->offset, (uint32_t)rel->raddr, *(int32_t*)(ctx->dst + rel->offset));
+                return FUNCHOOK_ERROR_IP_RELATIVE_OFFSET;
+            }
         }
         ctx->rip_disp->disp[1].dst_addr = rel->addr;
         ctx->rip_disp->disp[1].src_addr_offset = (ctx->dst - ctx->dst_base) + insn_size;
         ctx->rip_disp->disp[1].pos_offset = (ctx->dst - ctx->dst_base) + rel->offset;
     } else if (rel->size != 0) {
-        funchook_set_error_message(ctx->funchook, "Could not fix ip-relative address. The size is not 32.");
+        funchook_set_error_message(ctx->funchook, "Could not fix ip-relative address. The size is not 32, 16 or 8.");
         return FUNCHOOK_ERROR_CANNOT_FIX_IP_RELATIVE;
     }
     return 0;
