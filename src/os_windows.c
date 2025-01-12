@@ -81,6 +81,60 @@ int funchook_free(funchook_t *funchook)
     return 0;
 }
 
+#ifdef CPU_64BIT
+static int get_free_address(funchook_t *funchook, void *func_addr, void *addrs[2]) {
+    void *cur_addr = 0;
+    // Limit search to JMP-able distance
+    if ((size_t)func_addr > INT32_MAX) {
+        cur_addr = (void*)((size_t)func_addr - INT32_MAX);
+    }
+    while (1) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(cur_addr, &mbi, sizeof(mbi)) == 0) {
+            DWORD err = GetLastError();
+            if (err == ERROR_INVALID_PARAMETER) {
+                // Reached top limit of address space without finding free memory above hint
+                // Hope addrs[0] is set
+                return 0;
+            }
+
+            char errbuf[128];
+
+            funchook_set_error_message(funchook, "Failed to execute VirtualQuery (addr=%p, error=%lu(%s))",
+                                       cur_addr,
+                                       err, to_errmsg(err, errbuf, sizeof(errbuf)));
+            return FUNCHOOK_ERROR_MEMORY_FUNCTION;
+        }
+        funchook_log(funchook, "  process map: "ADDR_FMT"-"ADDR_FMT" %s\n",
+                     (size_t)mbi.BaseAddress, (size_t)mbi.BaseAddress + mbi.RegionSize,
+                     (mbi.State == MEM_FREE) ? "free" : "used");
+        if (mbi.State == MEM_FREE) {
+            if ((size_t)mbi.BaseAddress < (size_t)func_addr) {
+                size_t addr = ROUND_DOWN((size_t)mbi.BaseAddress + mbi.RegionSize - allocation_unit, allocation_unit);
+                if (addr >= (size_t)mbi.BaseAddress) {
+                    addrs[0] = (void*)addr;
+                }
+            }
+            if ((size_t)func_addr < (size_t)mbi.BaseAddress) {
+                size_t addr = ROUND_UP((size_t)mbi.BaseAddress, allocation_unit);
+                intptr_t diff = addr - (size_t)mbi.BaseAddress;
+                if (diff >= 0) {
+                    if (mbi.RegionSize - diff >= allocation_unit) {
+                        addrs[1] = (void*)addr;
+                        return 0;
+                    }
+                }
+            }
+        }
+        cur_addr = (void*)((size_t)mbi.BaseAddress + mbi.RegionSize);
+        if ((size_t)cur_addr > (size_t)func_addr + INT32_MAX) {
+            // following addresses would not be useful, exit
+            return 0;
+        }
+    }
+}
+#endif
+
 /* Reserve 64K bytes (allocation_unit) and use the first
  * 4K bytes (1 page) as the control page.
  */
@@ -90,34 +144,24 @@ static int alloc_page_info(funchook_t *funchook, page_list_t **pl_out, void *hin
     page_list_t *pl;
 #ifdef CPU_64BIT
     void *old_hint = hint;
-    while (1) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (VirtualQuery(hint, &mbi, sizeof(mbi)) == 0) {
-            DWORD err = GetLastError();
-            char errbuf[128];
-
-            funchook_set_error_message(funchook, "Failed to execute VirtualQuery (addr=%p, error=%lu(%s))",
-                                       hint,
-                                       err, to_errmsg(err, errbuf, sizeof(errbuf)));
-            return FUNCHOOK_ERROR_MEMORY_FUNCTION;
-        }
-        funchook_log(funchook, "  process map: "ADDR_FMT"-"ADDR_FMT" %s\n",
-                     (size_t)mbi.BaseAddress, (size_t)mbi.BaseAddress + mbi.RegionSize,
-                     (mbi.State == MEM_FREE) ? "free" : "used");
-        if (mbi.State == MEM_FREE) {
-            size_t addr = ROUND_UP((size_t)mbi.BaseAddress, allocation_unit);
-            intptr_t diff = addr - (size_t)mbi.BaseAddress;
-            if (diff >= 0) {
-                if (mbi.RegionSize - diff >= allocation_unit) {
-                    hint = (void*)addr;
-                    funchook_log(funchook, "  change hint address from %p to %p\n",
-                                 old_hint, hint);
-                    break;
-                }
-            }
-        }
-        hint = (void*)((size_t)mbi.BaseAddress + mbi.RegionSize);
+    void *addrs[2];
+    int rv = get_free_address(funchook, hint, addrs);
+    if (rv != 0) {
+        return rv;
     }
+    // No need to check if within JMP-distance, get_free_address already limits the search to that
+    // Prefer location above hint
+    if (addrs[1] != NULL) {
+        hint = addrs[1];
+    } else if (addrs[0] != NULL) {
+        hint = addrs[0];
+    } else {
+        funchook_set_error_message(funchook, "Could not find a free region near %p",
+                                   old_hint);
+        return FUNCHOOK_ERROR_MEMORY_ALLOCATION;
+    }
+    funchook_log(funchook, "  change hint address from %p to %p\n",
+                 old_hint, hint);
 #else
     hint = NULL;
 #endif
